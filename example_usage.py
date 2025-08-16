@@ -231,15 +231,69 @@ if __name__ == "__main__":
     
     # Analyze performance for each strategy
     print("\n" + "="*60)
-    print("PERFORMANCE ANALYSIS")
+    print("PERFORMANCE ANALYSIS WITH BACKTESTING")
     print("="*60)
     
+    backtest_results = {}
+    
+    # Create a simple benchmark (equal-weight portfolio return)
+    benchmark_returns = returns.mean(axis=1)
+    
     for name, signal in results.items():
-        analyze_signal_performance(signal, returns, name)
+        print(f"\n{'─'*40}")
+        print(f"BACKTESTING STRATEGY: {name.upper()}")
+        print(f"{'─'*40}")
+        
+        try:
+            # Run integrated backtest
+            backtest_metrics = backtest_signal(
+                signal=signal,
+                returns_data=returns,
+                transaction_cost=0.001,  # 0.1% transaction cost
+                max_position=0.1,
+                leverage_limit=1.0,
+                benchmark_returns=benchmark_returns
+            )
+            
+            backtest_results[name] = backtest_metrics
+            
+            # Print results for this strategy
+            print_backtest_results(backtest_metrics, name)
+            
+        except Exception as e:
+            print(f"Error backtesting {name}: {str(e)}")
+    
+    # Compare all strategies
+    if len(backtest_results) > 1:
+        print(f"\n{'='*80}")
+        print("STRATEGY COMPARISON")
+        print(f"{'='*80}")
+        compare_strategies(backtest_results, 
+                         save_path='/home/mingd/Documents/Projects/alpha/alpha_infra/strategy_comparison.png')
+    
+    # Plot detailed results for best strategy
+    if backtest_results:
+        # Find best strategy by Sharpe ratio
+        best_strategy = max([name for name, metrics in backtest_results.items() if metrics], 
+                          key=lambda x: backtest_results[x].get('sharpe_ratio', -999))
+        
+        print(f"\n{'='*60}")
+        print(f"DETAILED ANALYSIS - BEST STRATEGY: {best_strategy.upper()}")
+        print(f"{'='*60}")
+        
+        plot_backtest_results(
+            backtest_results[best_strategy],
+            benchmark_returns,
+            strategy_name=best_strategy,
+            save_path=f'/home/mingd/Documents/Projects/alpha/alpha_infra/{best_strategy}_detailed.png'
+        )
     
     # Plot all signals
     if results:
         print(f"\nPlotting {len(results)} signals...")
         plot_signals(results)
     
-    print("\nDone! Check 'signals_example.png' for visualizations.")
+    print("\nDone! Check the following files for detailed analysis:")
+    print("• 'signals_example.png' - Signal visualizations")
+    print("• 'strategy_comparison.png' - Strategy comparison charts")
+    print("• '*_detailed.png' - Detailed analysis of best performing strategy")
