@@ -139,18 +139,28 @@ def principal_component(data: pd.DataFrame, n_components: int = 1) -> pd.Series:
     """Extract first principal component."""
     from sklearn.decomposition import PCA
     
-    # Handle NaN values
+    # Handle NaN values - drop rows with any NaN
     data_clean = data.dropna()
     if len(data_clean) == 0:
         return pd.Series(index=data.index, dtype=float)
     
+    # PCA expects samples (dates) as rows and features (assets) as columns
+    # So we use data_clean directly (dates x assets)
     pca = PCA(n_components=n_components)
-    pc = pca.fit_transform(data_clean.T)
     
-    result = pd.Series(index=data.index, dtype=float)
-    result.loc[data_clean.index] = pc[:, 0]
+    try:
+        # Fit and transform the data (dates x assets)
+        pc_scores = pca.fit_transform(data_clean)  # Shape: (n_dates, n_components)
+        
+        # Create result series with first principal component
+        result = pd.Series(index=data.index, dtype=float)
+        result.loc[data_clean.index] = pc_scores[:, 0]  # First component for each date
+        
+        return result
     
-    return result
+    except Exception:
+        # If PCA fails, return cross-sectional mean as fallback
+        return data_clean.mean(axis=1)
 
 # =============================================================================
 # STEP 4: POST-PROCESSING FUNCTIONS (r -> s)
