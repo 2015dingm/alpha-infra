@@ -301,6 +301,41 @@ def leverage_constraint(positions: pd.Series, max_leverage: float = 1.0) -> pd.S
         return positions * (max_leverage / current_leverage)
     return positions
 
+def risk_managed_positions(positions: pd.Series, 
+                         returns_data: pd.DataFrame,
+                         risk_method: str = 'ridge',
+                         lookback_window: int = 126,
+                         **risk_params) -> pd.Series:
+    """
+    Apply risk management to position sizing using covariance matrix.
+    
+    Parameters:
+    -----------
+    positions : pd.Series
+        Raw position signals
+    returns_data : pd.DataFrame
+        Historical returns data
+    risk_method : str
+        Risk adjustment method: 'ridge', 'shrinkage', 'sqrt', 'threshold'
+    lookback_window : int
+        Lookback window for covariance estimation
+    **risk_params : dict
+        Parameters for the risk method
+        
+    Returns:
+    --------
+    pd.Series
+        Risk-adjusted positions
+    """
+    
+    return apply_risk_management(
+        signal=positions,
+        returns_data=returns_data,
+        risk_method=risk_method,
+        lookback_window=lookback_window,
+        **risk_params
+    )
+
 # =============================================================================
 # PIPELINE ORCHESTRATION FUNCTIONS
 # =============================================================================
@@ -345,10 +380,11 @@ def build_pipeline_config() -> Dict[str, Dict[str, Callable]]:
             'volatility_target': volatility_target,
             'position_limits': position_limits,
             'leverage_constraint': leverage_constraint,
+            'risk_managed_positions': risk_managed_positions,
         }
     }
 
-def run_alpha_pipeline(returns: pd.DataFrame, 
+def run_alpha_pipeline(returns_data: pd.DataFrame, 
                       pipeline_config: Dict[str, Dict[str, Any]]) -> pd.Series:
     """
     Execute the full alpha generation pipeline.
@@ -372,7 +408,7 @@ def run_alpha_pipeline(returns: pd.DataFrame,
     """
     
     available_functions = build_pipeline_config()
-    data = returns.copy()
+    data = returns_data.copy()
     
     # Step 1: Windowing
     windowed_data = None
@@ -434,7 +470,13 @@ def run_alpha_pipeline(returns: pd.DataFrame,
         func_name = pipeline_config['position_sizing']['function']
         params = pipeline_config['position_sizing']['params']
         position_func = available_functions['position_sizing'][func_name]
-        data = position_func(data, **params)
+        
+        # Special handling for risk-managed positions
+        if func_name == 'risk_managed_positions':
+            # Pass returns data for covariance computation
+            data = position_func(data, returns_data, **params)
+        else:
+            data = position_func(data, **params)
     
     return data
 
@@ -466,6 +508,256 @@ def validate_pipeline_config(config: Dict[str, Dict[str, Any]]) -> bool:
             return False
     
     return True
+
+# =============================================================================
+# RISK MANAGEMENT FUNCTIONS
+# =============================================================================
+
+def compute_covariance_matrix(returns_data: pd.DataFrame, 
+                            window: int = 252,
+                            min_periods: int = None) -> pd.DataFrame:
+    """Compute rolling covariance matrix of returns."""
+    if min_periods is None:
+        min_periods = max(window // 2, len(returns_data.columns) + 1)
+    
+    # Use the most recent window of data
+    recent_data = returns_data.tail(window)
+    if len(recent_data) < min_periods:
+        recent_data = returns_data  # Use all available data if insufficient
+    
+    # Remove any columns with insufficient data
+    valid_data = recent_data.dropna(axis=1, thresh=min_periods)
+    
+    if valid_data.empty:
+        return pd.DataFrame()
+    
+    return valid_data.cov()
+
+def spectral_risk_adjustment(covariance_matrix: pd.DataFrame,
+                           weights: pd.Series,
+                           method: str = 'ridge',
+                           **kwargs) -> pd.Series:
+    """
+    Apply risk adjustment using spectral decomposition of covariance matrix.
+    
+    Parameters:
+    -----------
+    covariance_matrix : pd.DataFrame
+        Covariance matrix of returns
+    weights : pd.Series
+        Portfolio weights
+    method : str
+        Eigenvalue adjustment method: 'ridge', 'shrinkage', 'sqrt', 'threshold'
+    **kwargs : dict
+        Method-specific parameters:
+        - ridge: lambda_reg (default: 0.01)
+        - shrinkage: alpha (default: 0.1)
+        - threshold: drop_largest (default: True)
+        
+    Returns:
+    --------
+    pd.Series
+        Risk-adjusted weights (C^{-1}w)
+    """
+    
+    if covariance_matrix.empty or weights.empty:
+        return weights.copy()
+    
+    # Align weights with covariance matrix
+    common_assets = covariance_matrix.index.intersection(weights.index)
+    if len(common_assets) == 0:
+        return weights.copy()
+    
+    cov_aligned = covariance_matrix.loc[common_assets, common_assets]
+    weights_aligned = weights.loc[common_assets]
+    
+    # Handle case where covariance matrix is too small
+    if len(cov_aligned) < 2:
+        return weights.copy()
+    
+    try:
+        # Spectral decomposition: C = Q Λ Q^T
+        eigenvalues, eigenvectors = np.linalg.eigh(cov_aligned.values)
+        
+        # Ensure eigenvalues are positive (numerical stability)
+        eigenvalues = np.maximum(eigenvalues, 1e-8)
+        
+        # Apply eigenvalue adjustment based on method
+        if method == 'ridge':
+            lambda_reg = kwargs.get('lambda_reg', 0.01)
+            adjusted_eigenvalues = eigenvalues + lambda_reg
+            
+        elif method == 'shrinkage':
+            alpha = kwargs.get('alpha', 0.1)
+            trace_over_n = np.trace(cov_aligned.values) / len(cov_aligned)
+            adjusted_eigenvalues = (1 - alpha) * eigenvalues + alpha * trace_over_n
+            
+        elif method == 'sqrt':
+            # Square root adjustment: use sqrt of eigenvalues
+            adjusted_eigenvalues = np.sqrt(eigenvalues)
+            
+        elif method == 'threshold':
+            drop_largest = kwargs.get('drop_largest', True)
+            adjusted_eigenvalues = eigenvalues.copy()
+            if drop_largest:
+                # Set largest eigenvalue to second largest
+                sorted_idx = np.argsort(eigenvalues)
+                if len(eigenvalues) > 1:
+                    adjusted_eigenvalues[sorted_idx[-1]] = eigenvalues[sorted_idx[-2]]
+            else:
+                # Drop smallest eigenvalue (set to second smallest)
+                sorted_idx = np.argsort(eigenvalues)
+                if len(eigenvalues) > 1:
+                    adjusted_eigenvalues[sorted_idx[0]] = eigenvalues[sorted_idx[1]]
+        
+        else:
+            raise ValueError(f"Unknown method: {method}")
+        
+        # Reconstruct inverse covariance matrix: C^{-1} = Q Λ^{-1} Q^T
+        inv_eigenvalues = 1.0 / adjusted_eigenvalues
+        inv_cov_matrix = eigenvectors @ np.diag(inv_eigenvalues) @ eigenvectors.T
+        
+        # Compute C^{-1}w
+        risk_adjusted_weights = inv_cov_matrix @ weights_aligned.values
+        
+        # Create result series
+        result = pd.Series(risk_adjusted_weights, index=common_assets)
+        
+        # Fill in assets not in covariance matrix with original weights
+        full_result = weights.copy()
+        full_result.loc[common_assets] = result
+        
+        return full_result
+        
+    except np.linalg.LinAlgError as e:
+        print(f"Warning: Linear algebra error in risk adjustment: {e}")
+        return weights.copy()
+    except Exception as e:
+        print(f"Warning: Error in risk adjustment: {e}")
+        return weights.copy()
+
+def portfolio_risk_metrics(weights: pd.Series, 
+                         covariance_matrix: pd.DataFrame) -> dict:
+    """Compute portfolio risk metrics given weights and covariance matrix."""
+    
+    # Align weights and covariance matrix
+    common_assets = weights.index.intersection(covariance_matrix.index)
+    if len(common_assets) < 2:
+        return {'portfolio_variance': 0.0, 'portfolio_volatility': 0.0}
+    
+    w = weights.loc[common_assets].values
+    C = covariance_matrix.loc[common_assets, common_assets].values
+    
+    # Portfolio variance: w^T C w
+    portfolio_variance = w.T @ C @ w
+    portfolio_volatility = np.sqrt(portfolio_variance)
+    
+    # Risk contribution: (C w) ⊙ w / (w^T C w)
+    marginal_risk = C @ w
+    risk_contribution = (marginal_risk * w) / (portfolio_variance + 1e-8)
+    
+    return {
+        'portfolio_variance': portfolio_variance,
+        'portfolio_volatility': portfolio_volatility,
+        'marginal_risk': pd.Series(marginal_risk, index=common_assets),
+        'risk_contribution': pd.Series(risk_contribution, index=common_assets)
+    }
+
+def apply_risk_management(signal: pd.Series,
+                        returns_data: pd.DataFrame,
+                        risk_method: str = 'ridge',
+                        lookback_window: int = 252,
+                        rebalance_frequency: int = 5,
+                        **risk_params) -> pd.Series:
+    """
+    Apply risk management to convert signals to risk-adjusted weights.
+    
+    Parameters:
+    -----------
+    signal : pd.Series
+        Trading signal
+    returns_data : pd.DataFrame
+        Historical returns data
+    risk_method : str
+        Risk adjustment method
+    lookback_window : int
+        Window for covariance estimation
+    rebalance_frequency : int
+        How often to recompute covariance matrix (in days)
+    **risk_params : dict
+        Parameters for risk adjustment method
+        
+    Returns:
+    --------
+    pd.Series
+        Risk-adjusted weights
+    """
+    
+    # Align signal with returns data
+    common_dates = signal.index.intersection(returns_data.index)
+    if len(common_dates) == 0:
+        return signal.copy()
+    
+    signal_aligned = signal.loc[common_dates]
+    returns_aligned = returns_data.loc[common_dates]
+    
+    risk_adjusted_weights = pd.Series(index=signal_aligned.index, dtype=float)
+    
+    # Initialize with first valid covariance matrix
+    current_cov_matrix = None
+    last_rebalance_date = None
+    
+    for i, date in enumerate(signal_aligned.index):
+        current_signal = signal_aligned.loc[date]
+        
+        # Check if we need to recompute covariance matrix
+        recompute_cov = (
+            current_cov_matrix is None or 
+            last_rebalance_date is None or
+            i - common_dates.get_loc(last_rebalance_date) >= rebalance_frequency
+        )
+        
+        if recompute_cov:
+            # Get historical data up to current date
+            historical_data = returns_aligned.loc[:date]
+            
+            # Compute covariance matrix
+            current_cov_matrix = compute_covariance_matrix(
+                historical_data, 
+                window=lookback_window
+            )
+            last_rebalance_date = date
+        
+        if current_cov_matrix is not None and not current_cov_matrix.empty:
+            # Convert signal to preliminary weights
+            # Simple approach: equal allocation based on signal strength
+            n_assets = len(returns_aligned.columns)
+            if current_signal != 0:
+                preliminary_weights = pd.Series(
+                    current_signal / n_assets, 
+                    index=returns_aligned.columns
+                )
+            else:
+                preliminary_weights = pd.Series(
+                    0.0, 
+                    index=returns_aligned.columns
+                )
+            
+            # Apply risk adjustment
+            risk_adjusted = spectral_risk_adjustment(
+                current_cov_matrix,
+                preliminary_weights,
+                method=risk_method,
+                **risk_params
+            )
+            
+            # Store the aggregated risk-adjusted weight
+            risk_adjusted_weights.loc[date] = risk_adjusted.sum()
+        else:
+            # Fallback to original signal if covariance computation fails
+            risk_adjusted_weights.loc[date] = current_signal
+    
+    return risk_adjusted_weights.fillna(0)
 
 # =============================================================================
 # BACKTESTING FUNCTIONS
@@ -1095,8 +1387,105 @@ def create_sample_pipeline_configs() -> Dict[str, Dict[str, Dict[str, Any]]]:
             'reduction': {'function': 'rolling_std', 'params': {}},
             'postprocessing': {'function': 'threshold', 'params': {'threshold': 0.5}},
             'position_sizing': {'function': 'volatility_target', 'params': {'target_vol': 0.15}}
+        },
+        'risk_managed_momentum': {
+            'windowing': {'function': 'rolling', 'params': {'window': 20}},
+            'preprocessing': {'function': 'z_score', 'params': {}},
+            'reduction': {'function': 'cross_sectional_mean', 'params': {}},
+            'postprocessing': {'function': 'rank', 'params': {}},
+            'position_sizing': {'function': 'risk_managed_positions', 
+                              'params': {'risk_method': 'ridge', 'lambda_reg': 0.01, 'lookback_window': 126}}
+        },
+        'shrinkage_mean_reversion': {
+            'windowing': {'function': 'rolling', 'params': {'window': 15}},
+            'preprocessing': {'function': 'robust_normalize', 'params': {}},
+            'reduction': {'function': 'cross_sectional_rank', 'params': {}},
+            'postprocessing': {'function': 'sign', 'params': {}},
+            'position_sizing': {'function': 'risk_managed_positions', 
+                              'params': {'risk_method': 'shrinkage', 'alpha': 0.2, 'lookback_window': 60}}
         }
     }
+
+def quick_risk_analysis(returns_data: pd.DataFrame, 
+                       signal: pd.Series,
+                       risk_methods: list = None) -> dict:
+    """
+    Quick comparison of different risk management methods.
+    
+    Parameters:
+    -----------
+    returns_data : pd.DataFrame
+        Historical returns data
+    signal : pd.Series
+        Trading signal
+    risk_methods : list, optional
+        List of risk methods to compare
+        
+    Returns:
+    --------
+    dict
+        Comparison results
+    """
+    
+    if risk_methods is None:
+        risk_methods = ['ridge', 'shrinkage', 'sqrt', 'threshold']
+    
+    results = {}
+    benchmark_returns = returns_data.mean(axis=1)
+    
+    print("Quick Risk Management Comparison")
+    print("-" * 50)
+    
+    # Base case (no risk management)
+    base_metrics = backtest_signal(
+        signal=signal,
+        returns_data=returns_data,
+        benchmark_returns=benchmark_returns
+    )
+    results['no_risk_mgmt'] = base_metrics
+    
+    # Risk managed cases
+    for method in risk_methods:
+        print(f"Testing {method}...")
+        
+        risk_params = {
+            'ridge': {'lambda_reg': 0.01},
+            'shrinkage': {'alpha': 0.2},
+            'sqrt': {},
+            'threshold': {'drop_largest': True}
+        }.get(method, {})
+        
+        try:
+            risk_adjusted_signal = apply_risk_management(
+                signal=signal,
+                returns_data=returns_data,
+                risk_method=method,
+                **risk_params
+            )
+            
+            metrics = backtest_signal(
+                signal=risk_adjusted_signal,
+                returns_data=returns_data,
+                benchmark_returns=benchmark_returns
+            )
+            
+            results[f'{method}_risk_mgmt'] = metrics
+            
+        except Exception as e:
+            print(f"Error with {method}: {str(e)}")
+    
+    # Print comparison
+    print(f"\n{'Method':<20} {'Sharpe':<8} {'Return':<8} {'Vol':<8} {'MaxDD':<8}")
+    print("-" * 60)
+    
+    for name, metrics in results.items():
+        if metrics:
+            print(f"{name:<20} {metrics.get('sharpe_ratio', 0):<8.3f} "
+                  f"{metrics.get('annual_return', 0):<8.2%} "
+                  f"{metrics.get('annual_volatility', 0):<8.2%} "
+                  f"{metrics.get('max_drawdown', 0):<8.2%}")
+    
+    return results
 
 if __name__ == "__main__":
     # Example usage
