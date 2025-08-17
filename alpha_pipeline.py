@@ -18,24 +18,89 @@ import warnings
 # STEP 1: WINDOWING FUNCTIONS (R -> R^w)
 # =============================================================================
 
-def rolling_window(returns: pd.DataFrame, window: int) -> pd.DataFrame:
-    """Create rolling window of returns."""
-    return returns.rolling(window=window)
+def rolling_window(returns: pd.DataFrame, window: int, shift: int = 0) -> pd.DataFrame:
+    """
+    Create rolling window of returns with optional shift.
+    
+    Parameters:
+    -----------
+    returns : pd.DataFrame
+        Input returns data
+    window : int
+        Window size for rolling calculation
+    shift : int, optional
+        Number of periods to shift the window backwards (default: 0)
+        Positive shift means using older data, avoiding immediate reversal
+    """
+    if shift > 0:
+        # Shift the data backwards to avoid immediate reversal
+        shifted_returns = returns.shift(shift)
+        return shifted_returns.rolling(window=window)
+    else:
+        return returns.rolling(window=window)
 
-def expanding_window(returns: pd.DataFrame, min_periods: int = 1) -> pd.DataFrame:
-    """Create expanding window of returns."""
-    return returns.expanding(min_periods=min_periods)
+def expanding_window(returns: pd.DataFrame, min_periods: int = 1, shift: int = 0) -> pd.DataFrame:
+    """
+    Create expanding window of returns with optional shift.
+    
+    Parameters:
+    -----------
+    returns : pd.DataFrame
+        Input returns data
+    min_periods : int
+        Minimum number of periods required
+    shift : int, optional
+        Number of periods to shift the window backwards (default: 0)
+    """
+    if shift > 0:
+        shifted_returns = returns.shift(shift)
+        return shifted_returns.expanding(min_periods=min_periods)
+    else:
+        return returns.expanding(min_periods=min_periods)
 
-def fixed_window(returns: pd.DataFrame, window: int, step: int = 1) -> list:
-    """Create fixed-size non-overlapping windows."""
+def fixed_window(returns: pd.DataFrame, window: int, step: int = 1, shift: int = 0) -> list:
+    """
+    Create fixed-size non-overlapping windows with optional shift.
+    
+    Parameters:
+    -----------
+    returns : pd.DataFrame
+        Input returns data
+    window : int
+        Window size
+    step : int
+        Step size between windows
+    shift : int, optional
+        Number of periods to shift backwards
+    """
+    if shift > 0:
+        shifted_returns = returns.shift(shift)
+    else:
+        shifted_returns = returns
+    
     windowed_data = []
-    for i in range(0, len(returns) - window + 1, step):
-        windowed_data.append(returns.iloc[i:i+window])
+    for i in range(0, len(shifted_returns) - window + 1, step):
+        windowed_data.append(shifted_returns.iloc[i:i+window])
     return windowed_data
 
-def exponential_window(returns: pd.DataFrame, alpha: float = 0.1) -> pd.DataFrame:
-    """Create exponentially weighted window."""
-    return returns.ewm(alpha=alpha)
+def exponential_window(returns: pd.DataFrame, alpha: float = 0.1, shift: int = 0) -> pd.DataFrame:
+    """
+    Create exponentially weighted window with optional shift.
+    
+    Parameters:
+    -----------
+    returns : pd.DataFrame
+        Input returns data
+    alpha : float
+        Smoothing parameter
+    shift : int, optional
+        Number of periods to shift backwards
+    """
+    if shift > 0:
+        shifted_returns = returns.shift(shift)
+        return shifted_returns.ewm(alpha=alpha)
+    else:
+        return returns.ewm(alpha=alpha)
 
 # =============================================================================
 # STEP 2: PRE-PROCESSING FUNCTIONS (R^w -> Ř^w)
@@ -410,8 +475,27 @@ def calculate_portfolio_returns(signal: pd.Series,
                                returns_data: pd.DataFrame,
                                transaction_cost: float = 0.001,
                                max_position: float = 0.1,
-                               leverage_limit: float = 1.0) -> pd.Series:
-    """Calculate portfolio returns from signal and asset returns."""
+                               leverage_limit: float = 1.0,
+                               rebalance_frequency: str = 'D') -> pd.Series:
+    """
+    Calculate portfolio returns from signal and asset returns with periodic rebalancing.
+    
+    Parameters:
+    -----------
+    signal : pd.Series
+        Trading signal (dates)
+    returns_data : pd.DataFrame  
+        Asset returns data (dates x assets)
+    transaction_cost : float
+        Transaction cost as percentage
+    max_position : float
+        Maximum position size per asset
+    leverage_limit : float
+        Maximum portfolio leverage
+    rebalance_frequency : str
+        Rebalancing frequency: 'D' (daily), 'W' (weekly), 'M' (monthly), 
+        'Q' (quarterly), or integer (every N days)
+    """
     
     # Align signal with returns data
     common_dates = signal.index.intersection(returns_data.index)
@@ -421,45 +505,132 @@ def calculate_portfolio_returns(signal: pd.Series,
     if len(signal_aligned) == 0:
         return pd.Series(dtype=float)
     
-    # Generate positions from signal
-    # Simple strategy: signal strength determines position allocation
+    # Determine rebalancing dates
+    rebalance_dates = _get_rebalancing_dates(signal_aligned.index, rebalance_frequency)
+    
+    # Generate positions from signal with periodic rebalancing
     n_assets = len(returns_aligned.columns)
     positions = pd.DataFrame(index=signal_aligned.index, columns=returns_aligned.columns, dtype=float)
     
+    current_positions = pd.Series(index=returns_aligned.columns, dtype=float).fillna(0.0)
+    
     for date in signal_aligned.index:
-        signal_strength = signal_aligned.loc[date]
-        
-        if pd.notna(signal_strength):
-            # Distribute signal across assets
-            if signal_strength > 0:
-                weight_per_asset = min(abs(signal_strength), max_position) / n_assets
-                positions.loc[date] = weight_per_asset
-            elif signal_strength < 0:
-                weight_per_asset = min(abs(signal_strength), max_position) / n_assets
-                positions.loc[date] = -weight_per_asset
+        # Check if this is a rebalancing date
+        if date in rebalance_dates:
+            # Recompute positions based on current signal
+            signal_strength = signal_aligned.loc[date]
+            
+            if pd.notna(signal_strength):
+                if signal_strength > 0:
+                    weight_per_asset = min(abs(signal_strength), max_position) / n_assets
+                    new_positions = pd.Series(weight_per_asset, index=returns_aligned.columns)
+                elif signal_strength < 0:
+                    weight_per_asset = min(abs(signal_strength), max_position) / n_assets
+                    new_positions = pd.Series(-weight_per_asset, index=returns_aligned.columns)
+                else:
+                    new_positions = pd.Series(0.0, index=returns_aligned.columns)
             else:
-                positions.loc[date] = 0.0
-        else:
-            positions.loc[date] = 0.0
+                new_positions = pd.Series(0.0, index=returns_aligned.columns)
+            
+            # Apply leverage limit
+            total_leverage = new_positions.abs().sum()
+            if total_leverage > leverage_limit:
+                new_positions *= leverage_limit / total_leverage
+            
+            current_positions = new_positions
         
-        # Apply leverage limit
-        total_leverage = positions.loc[date].abs().sum()
-        if total_leverage > leverage_limit:
-            positions.loc[date] *= leverage_limit / total_leverage
+        # Use current positions (either newly computed or carried forward)
+        positions.loc[date] = current_positions
     
     positions = positions.fillna(0)
     
     # Calculate portfolio returns
     portfolio_returns = (positions.shift(1) * returns_aligned).sum(axis=1).fillna(0)
     
-    # Apply transaction costs
-    position_changes = positions.diff().abs().sum(axis=1)
-    transaction_costs = position_changes * transaction_cost
+    # Apply transaction costs only on rebalancing dates
+    transaction_costs = pd.Series(0.0, index=portfolio_returns.index)
+    prev_positions = None
+    
+    for date in positions.index:
+        if date in rebalance_dates:
+            if prev_positions is not None:
+                # Calculate position changes and apply transaction costs
+                position_changes = (positions.loc[date] - prev_positions).abs().sum()
+                transaction_costs.loc[date] = position_changes * transaction_cost
+            prev_positions = positions.loc[date]
     
     # Net returns after costs
     net_returns = portfolio_returns - transaction_costs
     
     return net_returns
+
+def _get_rebalancing_dates(date_index: pd.DatetimeIndex, frequency: str) -> set:
+    """
+    Get rebalancing dates based on frequency.
+    
+    Parameters:
+    -----------
+    date_index : pd.DatetimeIndex
+        All available dates
+    frequency : str
+        Rebalancing frequency
+        
+    Returns:
+    --------
+    set
+        Set of rebalancing dates
+    """
+    
+    if frequency == 'D':
+        # Daily rebalancing - all dates
+        return set(date_index)
+    
+    elif frequency == 'W':
+        # Weekly rebalancing - every Monday (or first day of week)
+        rebalance_dates = []
+        current_week = None
+        for date in date_index:
+            week_number = date.isocalendar()[1]  # ISO week number
+            if week_number != current_week:
+                rebalance_dates.append(date)
+                current_week = week_number
+        return set(rebalance_dates)
+    
+    elif frequency == 'M':
+        # Monthly rebalancing - first day of each month
+        rebalance_dates = []
+        current_month = None
+        for date in date_index:
+            month = date.month
+            if month != current_month:
+                rebalance_dates.append(date)
+                current_month = month
+        return set(rebalance_dates)
+    
+    elif frequency == 'Q':
+        # Quarterly rebalancing - first day of each quarter
+        rebalance_dates = []
+        current_quarter = None
+        for date in date_index:
+            quarter = (date.month - 1) // 3 + 1
+            if quarter != current_quarter:
+                rebalance_dates.append(date)
+                current_quarter = quarter
+        return set(rebalance_dates)
+    
+    elif frequency.isdigit():
+        # Every N days
+        n_days = int(frequency)
+        rebalance_dates = []
+        for i, date in enumerate(date_index):
+            if i % n_days == 0:
+                rebalance_dates.append(date)
+        return set(rebalance_dates)
+    
+    else:
+        # Default to daily if frequency not recognized
+        print(f"Warning: Unknown frequency '{frequency}', defaulting to daily")
+        return set(date_index)
 
 def calculate_performance_metrics(portfolio_returns: pd.Series,
                                  benchmark_returns: pd.Series = None) -> dict:
@@ -561,7 +732,8 @@ def backtest_signal(signal: pd.Series,
                    transaction_cost: float = 0.001,
                    max_position: float = 0.1,
                    leverage_limit: float = 1.0,
-                   benchmark_returns: pd.Series = None) -> dict:
+                   benchmark_returns: pd.Series = None,
+                   rebalance_frequency: str = 'D') -> dict:
     """
     Backtest a trading signal against historical returns.
     
@@ -579,6 +751,8 @@ def backtest_signal(signal: pd.Series,
         Maximum portfolio leverage
     benchmark_returns : pd.Series, optional
         Benchmark returns for comparison
+    rebalance_frequency : str
+        Rebalancing frequency: 'D', 'W', 'M', 'Q', or integer (days)
         
     Returns:
     --------
@@ -586,17 +760,27 @@ def backtest_signal(signal: pd.Series,
         Dictionary containing performance metrics and results
     """
     
-    # Calculate portfolio returns
+    # Calculate portfolio returns with periodic rebalancing
     portfolio_returns = calculate_portfolio_returns(
         signal=signal,
         returns_data=returns_data,
         transaction_cost=transaction_cost,
         max_position=max_position,
-        leverage_limit=leverage_limit
+        leverage_limit=leverage_limit,
+        rebalance_frequency=rebalance_frequency
     )
     
     # Calculate performance metrics
     metrics = calculate_performance_metrics(portfolio_returns, benchmark_returns)
+    
+    # Add rebalancing information to metrics
+    metrics['rebalance_frequency'] = rebalance_frequency
+    
+    # Calculate number of rebalancing events
+    if len(portfolio_returns) > 0:
+        rebalance_dates = _get_rebalancing_dates(portfolio_returns.index, rebalance_frequency)
+        metrics['rebalancing_events'] = len(rebalance_dates)
+        metrics['avg_days_between_rebalance'] = len(portfolio_returns) / len(rebalance_dates) if len(rebalance_dates) > 0 else 0
     
     return metrics
 
@@ -632,6 +816,14 @@ def print_backtest_results(metrics: dict, strategy_name: str = "Strategy"):
     print(f"Average Win:            {metrics.get('avg_win', 0):8.4f}")
     print(f"Average Loss:           {metrics.get('avg_loss', 0):8.4f}")
     print(f"Total Periods:          {metrics.get('total_periods', 0):8d}")
+    
+    # Rebalancing information if available
+    if 'rebalancing_events' in metrics:
+        print(f"\n🔄 REBALANCING INFO")
+        print(f"{'─'*40}")
+        print(f"Frequency:              {metrics.get('rebalance_frequency', 'N/A'):>8}")
+        print(f"Total Rebalances:       {metrics.get('rebalancing_events', 0):8d}")
+        print(f"Avg Days Between:       {metrics.get('avg_days_between_rebalance', 0):8.1f}")
     
     # Benchmark comparison if available
     if 'information_ratio' in metrics:
@@ -809,6 +1001,7 @@ def run_alpha_pipeline_with_backtest(returns_data: pd.DataFrame,
                                     max_position: float = 0.1,
                                     leverage_limit: float = 1.0,
                                     benchmark_returns: pd.Series = None,
+                                    rebalance_frequency: str = 'D',
                                     strategy_name: str = "Alpha Strategy",
                                     print_results: bool = True,
                                     plot_results: bool = True,
@@ -830,6 +1023,9 @@ def run_alpha_pipeline_with_backtest(returns_data: pd.DataFrame,
         Maximum leverage
     benchmark_returns : pd.Series, optional
         Benchmark for comparison
+    rebalance_frequency : str
+        Rebalancing frequency: 'D' (daily), 'W' (weekly), 'M' (monthly), 
+        'Q' (quarterly), or integer (every N days)
     strategy_name : str
         Strategy name
     print_results : bool
@@ -848,19 +1044,28 @@ def run_alpha_pipeline_with_backtest(returns_data: pd.DataFrame,
     # Step 1: Generate alpha signal
     signal = run_alpha_pipeline(returns_data, pipeline_config)
     
-    # Step 2: Backtest the signal
+    # Step 2: Backtest the signal with periodic rebalancing
     backtest_metrics = backtest_signal(
         signal=signal,
         returns_data=returns_data,
         transaction_cost=transaction_cost,
         max_position=max_position,
         leverage_limit=leverage_limit,
-        benchmark_returns=benchmark_returns
+        benchmark_returns=benchmark_returns,
+        rebalance_frequency=rebalance_frequency
     )
     
     # Step 3: Display results
     if print_results:
         print_backtest_results(backtest_metrics, strategy_name)
+        
+        # Print rebalancing information
+        if 'rebalancing_events' in backtest_metrics:
+            print(f"\n🔄 REBALANCING INFO")
+            print(f"{'─'*40}")
+            print(f"Frequency:              {backtest_metrics['rebalance_frequency']}")
+            print(f"Total Rebalances:       {backtest_metrics['rebalancing_events']:8d}")
+            print(f"Avg Days Between:       {backtest_metrics['avg_days_between_rebalance']:8.1f}")
     
     if plot_results and backtest_metrics:
         save_path = f"{strategy_name.lower().replace(' ', '_')}_backtest.png" if save_plots else None
