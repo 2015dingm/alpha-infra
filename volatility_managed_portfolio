@@ -1,0 +1,136 @@
+# Retry demo without dill to avoid missing dependency.
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.covariance import LedoitWolf
+from statsmodels.tsa.ar_model import AutoReg
+
+def to_monthly_period_end(daily_index):
+    return daily_index.to_period('M')
+
+def realized_variance_by_month(daily_factor_returns):
+    periods = to_monthly_period_end(daily_factor_returns.index)
+    rv = daily_factor_returns.groupby(periods).apply(lambda df: ((df - df.mean()).pow(2).sum(axis=0)))
+    rv.index = rv.index.to_timestamp('M')
+    return rv
+
+def monthly_factor_returns_from_daily(daily_factor_returns):
+    periods = to_monthly_period_end(daily_factor_returns.index)
+    mr = daily_factor_returns.groupby(periods).apply(lambda df: df.sum(axis=0))
+    mr.index = mr.index.to_timestamp('M')
+    return mr
+
+def vol_managed_single(f_monthly, rv_monthly, method='inv_var', c_normalize=True, cap=None):
+    f = f_monthly.copy().sort_index()
+    rv = rv_monthly.copy().sort_index()
+    f_next = f.shift(-1)
+    if method == 'inv_vol':
+        weights = 1.0 / np.sqrt(rv)
+    elif method == 'inv_var':
+        weights = 1.0 / rv
+    elif method == 'expected_var':
+        # simple persistence forecast (could be replaced by AR(1) fit)
+        rho = np.corrcoef(np.log(rv.replace(0, np.nan).dropna()[:-1]), np.log(rv.replace(0, np.nan).dropna()[1:]))[0,1] if len(rv.dropna())>2 else 0
+        expected_var = rv * rho
+        expected_var = expected_var.replace(0, np.nan).fillna(method='ffill').fillna(method='bfill')
+        weights = 1.0 / expected_var
+    else:
+        raise ValueError("method must be one of 'inv_var','inv_vol','expected_var'")
+    weights = weights.replace([np.inf, -np.inf], np.nan).fillna(method='ffill').fillna(method='bfill')
+    if cap is not None:
+        weights = weights.clip(upper=cap)
+    managed = weights * f_next
+    managed = managed.dropna()
+    if c_normalize:
+        f_for_norm = f.loc[managed.index]
+        c = f_for_norm.std(ddof=0) / managed.std(ddof=0) if managed.std(ddof=0) > 0 else 1.0
+        managed = managed * c
+    return managed
+
+def compute_mve_weights(returns_df, shrink=True):
+    mu = returns_df.mean(axis=0).values
+    if shrink:
+        try:
+            lw = LedoitWolf().fit(returns_df.values)
+            Sigma = lw.covariance_
+        except Exception:
+            Sigma = np.cov(returns_df.values, rowvar=False)
+    else:
+        Sigma = np.cov(returns_df.values, rowvar=False)
+    try:
+        w = np.linalg.solve(Sigma, mu)
+    except np.linalg.LinAlgError:
+        w = np.dot(np.linalg.pinv(Sigma), mu)
+    if np.sum(np.abs(w)) == 0:
+        return pd.Series(w, index=returns_df.columns)
+    w = w / np.sum(np.abs(w))
+    return pd.Series(w, index=returns_df.columns)
+
+def build_mve_series(monthly_returns_df, window=None, shrink=True):
+    if window is None:
+        b = compute_mve_weights(monthly_returns_df, shrink=shrink)
+        mve = monthly_returns_df.dot(b)
+        return mve, b
+    else:
+        out_index = monthly_returns_df.index[window:]
+        series = []
+        weights_list = []
+        for i in range(window, len(monthly_returns_df)):
+            insample = monthly_returns_df.iloc[i-window:i]
+            b = compute_mve_weights(insample, shrink=shrink)
+            ret = monthly_returns_df.iloc[i].dot(b)
+            series.append(ret)
+            weights_list.append(b)
+        series = pd.Series(series, index=out_index)
+        return series, weights_list
+
+def vol_manage_portfolio_series(portfolio_returns, rv_portfolio, method='inv_var', c_normalize=True, cap=None):
+    return vol_managed_single(portfolio_returns, rv_portfolio, method=method, c_normalize=c_normalize, cap=cap)
+
+# Synthetic demo
+np.random.seed(42)
+dates = pd.bdate_range(start='2012-01-01', periods=2520)
+K = 5
+base = np.random.normal(0, 1, size=(len(dates), K))
+months = to_monthly_period_end(dates)
+month_index = months.unique()
+sigma_month = pd.Series(0.01 + 0.03 * np.sin(np.linspace(0, 10, len(month_index))), index=month_index.to_timestamp('M'))
+sigma_daily = months.map(lambda p: sigma_month.loc[p.to_timestamp('M')]).values[:, None]
+daily_factors = pd.DataFrame(base * sigma_daily, index=dates, columns=[f'F{i+1}' for i in range(K)])
+
+monthly_returns = monthly_factor_returns_from_daily(daily_factors)
+rv = realized_variance_by_month(daily_factors)
+
+f1_monthly = monthly_returns['F1']
+rv_f1 = rv['F1']
+f1_vm = vol_managed_single(f1_monthly, rv_f1, method='inv_var', c_normalize=True, cap=3)
+
+print("Single-factor demo (F1) — head of raw vs vol-managed:")
+print(pd.DataFrame({'raw': f1_monthly.loc[f1_vm.index].head(), 'vm': f1_vm.head()}))
+
+mve_full, b_full = build_mve_series(monthly_returns, window=None, shrink=True)
+daily_port = (daily_factors * b_full.reindex(daily_factors.columns).values).sum(axis=1)
+rv_port = realized_variance_by_month(daily_port.to_frame('port'))['port']
+mve_vm = vol_manage_portfolio_series(mve_full, rv_port, method='inv_var', c_normalize=True, cap=3)
+
+print("\nMVE weights (full-sample):")
+print(b_full.round(4))
+print("\nMVE demo — head of raw vs vol-managed:")
+print(pd.DataFrame({'mve_raw': mve_full.loc[mve_vm.index].head(), 'mve_vm': mve_vm.head()}))
+
+# plot cumulative returns for demonstration
+cum = pd.DataFrame({
+    'F1_raw': f1_monthly.loc[f1_vm.index].cumsum(),
+    'F1_vm': f1_vm.cumsum(),
+    'MVE_raw': mve_full.loc[mve_vm.index].cumsum(),
+    'MVE_vm': mve_vm.cumsum()
+})
+ax = cum.plot(title='Cumulative returns (demo synthetic data)', figsize=(10,6))
+ax.set_ylabel('Cumulative return (sum of monthly returns)')
+plt.show()
+
+print("\nDemo complete. To run on your data, replace `daily_factors` with your daily factor returns DataFrame and call:")
+print("  monthly_returns = monthly_factor_returns_from_daily(your_daily_df)")
+print("  rv = realized_variance_by_month(your_daily_df)")
+print("  single-factor: vol_managed_single(monthly_returns['YourFactor'], rv['YourFactor'])")
+print("  multifactor rolling backtest: build_mve_series(monthly_returns, window=36)  # then vol-manage as shown")
