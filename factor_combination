@@ -1,0 +1,258 @@
+# vm_rp_hrp.py
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
+from scipy.cluster.hierarchy import linkage, dendrogram
+from scipy.spatial.distance import squareform
+
+# Optional: Ledoit-Wolf shrinkage for covariance estimation
+try:
+    from sklearn.covariance import LedoitWolf
+    have_lw = True
+except Exception:
+    have_lw = False
+
+# ---------------------------
+# Utilities
+# ---------------------------
+def align_df(a: pd.DataFrame, b: pd.DataFrame):
+    return a.reindex(index=b.index, columns=b.columns)
+
+def to_month_end(idx):
+    return idx.to_period('M')
+
+# ---------------------------
+# 1) From exposures -> daily factor returns
+# exposures: dict factor_name -> DataFrame (daily x instruments)
+# R_inst: DataFrame (daily x instruments) of instrument returns
+# ---------------------------
+def daily_factor_returns_from_exposures(R_inst: pd.DataFrame, exposures: dict):
+    """
+    Return DataFrame of daily factor returns (columns = factor names).
+    exposures: dict {factor_name: exposures_df} where exposures_df aligns with R_inst.
+    """
+    df_list = []
+    names = []
+    for name, X in exposures.items():
+        Xa = X.reindex(index=R_inst.index, columns=R_inst.columns).fillna(0.0)
+        fr = (Xa * R_inst).sum(axis=1)   # series
+        df_list.append(fr.rename(name))
+        names.append(name)
+    if len(df_list) == 0:
+        return pd.DataFrame(index=R_inst.index)
+    return pd.concat(df_list, axis=1)
+
+# ---------------------------
+# 2) Monthly aggregation: monthly returns and realized variance
+# ---------------------------
+def monthly_returns_and_rv(daily_factor_df: pd.DataFrame):
+    """
+    monthly_returns: DataFrame indexed by month-end, values = sum of daily returns inside month
+    rv: DataFrame indexed by month-end, values = sum squared demeaned daily returns inside month (realized variance)
+    """
+    periods = daily_factor_df.index.to_period('M')
+    monthly_ret = daily_factor_df.groupby(periods).apply(lambda df: df.sum(axis=0))
+    monthly_ret.index = monthly_ret.index.to_timestamp('M')
+    rv = daily_factor_df.groupby(periods).apply(lambda df: ((df - df.mean()).pow(2).sum(axis=0)))
+    rv.index = rv.index.to_timestamp('M')
+    return monthly_ret, rv
+
+# ---------------------------
+# 3) Volatility Management (return-scaling and exposure-scaling)
+# ---------------------------
+def vol_weights_from_rv(rv_series: pd.Series, method='inv_var', cap=None):
+    """
+    rv_series: Series indexed by month-end = realized variance for month t (used to scale t+1)
+    method: 'inv_var' or 'inv_vol'
+    returns: weights series indexed by month-end (weights for month t -> applied to returns at t+1)
+    """
+    if method == 'inv_var':
+        w = 1.0 / rv_series
+    elif method == 'inv_vol':
+        w = 1.0 / np.sqrt(rv_series)
+    else:
+        raise ValueError("method must be 'inv_var' or 'inv_vol'")
+    w = w.replace([np.inf, -np.inf], np.nan).fillna(method='ffill').fillna(method='bfill')
+    if cap is not None:
+        w = w.clip(upper=cap)
+    return w
+
+def vol_manage_returns(monthly_ret: pd.Series, rv_series: pd.Series, method='inv_var', cap=None, c_normalize=True):
+    """
+    Scale next month's return by previous month's RV.
+    monthly_ret: Series r_t (index month-end)
+    rv_series: Series RV_t (index month-end), used to scale r_{t+1}
+    Returns: managed monthly series aligned at t+1 (index starts from second month)
+    """
+    w = vol_weights_from_rv(rv_series, method=method, cap=cap)
+    r_next = monthly_ret.shift(-1)
+    managed_raw = w * r_next
+    managed = managed_raw.dropna()
+    if c_normalize and not managed.empty:
+        common = monthly_ret.loc[managed.index]
+        if managed.std(ddof=0) > 0:
+            c = common.std(ddof=0) / managed.std(ddof=0)
+            managed = managed * c
+    return managed, w
+
+def vol_manage_exposures(exposures_df: pd.DataFrame, rv_series: pd.Series, method='inv_var', cap=None):
+    """
+    exposures_df: DataFrame of daily exposures for one factor (index daily, columns instruments).
+    rv_series: Series indexed by month-end with RV_t (for month t -> weight for month t+1)
+    Returns: dict month_end -> exposures_df_scaled for that next month
+    (Practical implementation: compute month-by-month scaled exposures for next month)
+    """
+    weights = vol_weights_from_rv(rv_series, method=method, cap=cap)
+    scaled_exposures = {}
+    # for each month t, compute scaled exposures to be applied during month t+1
+    # exposures_df expected to be daily; take exposures at the start of next month
+    for t_idx in range(len(weights.index)-1):  # last weight scales beyond available returns
+        month_t = weights.index[t_idx]
+        month_t1 = weights.index[t_idx+1]
+        w_t = weights.iloc[t_idx]
+        # get exposures to use in month t+1: you may use exposures on last business day of month_t (or first day of next month)
+        # here we pick exposures at the first date of month_t1 available in exposures_df
+        mask = (exposures_df.index.to_period('M') == month_t1.to_period('M'))
+        if mask.any():
+            # scale all exposures in month t+1 by w_t
+            scaled_exposures[month_t1] = exposures_df.loc[mask] * w_t
+        else:
+            # fallback: use last available exposures
+            scaled_exposures[month_t1] = exposures_df.iloc[-1:] * w_t
+    return scaled_exposures
+
+# ---------------------------
+# 4) Risk Parity (ERC numerical solver)
+# ---------------------------
+def rc_from_weights(w: np.ndarray, cov: np.ndarray):
+    """component risk contributions (not normalized)"""
+    w = np.asarray(w)
+    mrc = cov.dot(w)
+    rc = w * mrc
+    return rc
+
+def objective_rp(w, cov):
+    rc = rc_from_weights(w, cov)
+    # percent contributions
+    total = rc.sum()
+    if total <= 0:
+        return 1e12
+    rc_perc = rc / total
+    target = np.ones(len(w)) / len(w)
+    return np.sum((rc_perc - target)**2)
+
+def compute_rp_weights_from_cov(cov: np.ndarray, bounds=None, init_w=None, tol=1e-12):
+    n = cov.shape[0]
+    if init_w is None:
+        init_w = np.ones(n) / n
+    if bounds is None:
+        bounds = tuple((0.0, 1.0) for _ in range(n))
+    cons = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1.0})
+    res = minimize(lambda x: objective_rp(x, cov), x0=init_w, method='SLSQP',
+                   bounds=bounds, constraints=cons, options={'ftol':tol, 'maxiter':2000})
+    if not res.success:
+        # fallback to inverse-vol
+        std = np.sqrt(np.diag(cov))
+        w = 1.0 / std
+        w = w / np.sum(np.abs(w))
+        return w
+    return res.x
+
+# ---------------------------
+# 5) HRP (López de Prado)
+# ---------------------------
+def correl_dist(corr):
+    return np.sqrt(0.5 * (1 - corr))
+
+def get_quasi_diag(link):
+    link = link.astype(int)
+    n = link[-1, 3]
+    def recursive_get(node):
+        if node < n:
+            return [node]
+        left = link[node - n, 0]
+        right = link[node - n, 1]
+        return recursive_get(left) + recursive_get(right)
+    return recursive_get(link.shape[0] + n - 1)
+
+def get_cluster_var(cov, cluster_items):
+    cov_slice = cov[np.ix_(cluster_items, cluster_items)]
+    ivp = 1.0 / np.diag(cov_slice)
+    ivp = ivp / ivp.sum()
+    cvar = ivp.dot(cov_slice).dot(ivp)
+    return cvar
+
+def recursive_bisection(cov, sorted_indices):
+    w = pd.Series(1.0, index=sorted_indices)
+    def _rec(indices):
+        if len(indices) == 1:
+            return
+        half = int(len(indices) / 2)
+        left = indices[:half]
+        right = indices[half:]
+        left_var = get_cluster_var(cov, left)
+        right_var = get_cluster_var(cov, right)
+        if left_var + right_var == 0:
+            alpha = 0.5
+        else:
+            alpha = 1.0 - left_var / (left_var + right_var)
+        w[left] *= alpha
+        w[right] *= (1.0 - alpha)
+        _rec(left)
+        _rec(right)
+    _rec(list(sorted_indices))
+    full = np.zeros(cov.shape[0])
+    for i, val in w.items():
+        full[i] = val
+    full = full / full.sum()
+    return full
+
+def hrp_weights_from_returns(returns_df: pd.DataFrame, shrink=True, linkage_method='single'):
+    # returns_df: monthly returns (index months, columns factors)
+    if shrink and have_lw:
+        try:
+            lw = LedoitWolf().fit(returns_df.values)
+            cov = lw.covariance_
+        except Exception:
+            cov = np.cov(returns_df.values, rowvar=False)
+    else:
+        cov = np.cov(returns_df.values, rowvar=False)
+    corr = np.corrcoef(returns_df.values, rowvar=False)
+    dist = correl_dist(corr)
+    condensed = squareform(dist, checks=False)
+    link = linkage(condensed, method=linkage_method)
+    sort_ix = get_quasi_diag(link)
+    w = recursive_bisection(cov, sort_ix)
+    return pd.Series(w, index=returns_df.columns)
+
+# ---------------------------
+# Example usage (outline)
+# ---------------------------
+# 1) Suppose you have:
+#    R_inst: daily instrument returns DataFrame
+#    exposures: dict of daily exposures {factor_name: exposures_df}
+#
+# daily_factors = daily_factor_returns_from_exposures(R_inst, exposures)
+# monthly_ret, rv = monthly_returns_and_rv(daily_factors)
+#
+# # VM per-factor (return-scaling)
+# managed_per_factor = {}
+# weights_per_factor = {}
+# for f in monthly_ret.columns:
+#     m, w = vol_manage_returns(monthly_ret[f], rv[f], method='inv_var', cap=3, c_normalize=True)
+#     managed_per_factor[f] = m
+#     weights_per_factor[f] = w
+#
+# # Combine managed factor monthly returns into DataFrame and compute RP/HRP on them
+# managed_df = pd.DataFrame(managed_per_factor).dropna(how='all')
+#
+# # compute covariance for RP/HRP (use monthly returns aligned)
+# cov = np.cov(managed_df.dropna().values, rowvar=False)
+# rp_w = compute_rp_weights_from_cov(cov)
+# hrp_w_series = hrp_weights_from_returns(managed_df.dropna())
+#
+# # apply exposure-scaling if you prefer to trade scaled exposures:
+# # for each factor exposures[f], produce scaled exposures per month t+1 via vol_manage_exposures()
+#
+# # Finally, build instrument-level portfolio exposures for month t as:
+# # X_port_t = sum_f (factor_weight[f] * scaled_exposure_f_t)  # factor_weight may be rp_w or hrp_w
